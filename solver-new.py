@@ -24,23 +24,12 @@ from ortools.sat.python import cp_model
 
 from google.protobuf import text_format
 
-from yaml import load, dump
-try:
-    from yaml import CLoader as Loader, CDumper as Dumper
-except ImportError:
-    from yaml import Loader, Dumper
-
-import math
-
 PARSER = argparse.ArgumentParser()
 PARSER.add_argument(
     '--output_proto',
     default="",
     help='Output file to write the cp_model'
     'proto to.')
-PARSER.add_argument(
-    '--input', default='data.yaml', help="YAML"
-)
 PARSER.add_argument('--params', default="", help='Sat solver parameters.')
 
 
@@ -201,17 +190,15 @@ def add_soft_sum_constraint(model, works, hard_min, soft_min, min_cost,
     return cost_variables, cost_coefficients
 
 
-def solve_shift_scheduling(params, output_proto, input):
+def solve_shift_scheduling(params, output_proto):
     """Solves the shift scheduling problem."""
-
-    data = load(open(input, 'r'), Loader=Loader)
-    users = list(range(122)) or data['users']
-    days = data['dates']
-
     # Data
-    # num_employees = 20
-    # num_weeks = 4
-    shifts = ['.', 'D', 'N']
+    st_employees = [1, 2, 3, 4]
+    ct_employees = [5, 6, 7, 8]
+    all_employees = st_employees + ct_employees
+    num_weeks = 4
+    shifts = ['O', 'D', 'N']
+    grades = ['CT', 'ST']
 
     # Fixed assignment: (employee, shift, day).
     # This fixes the first 2 days of the schedule.
@@ -237,29 +224,23 @@ def solve_shift_scheduling(params, output_proto, input):
     # Request: (employee, shift, day, weight)
     # A negative weight indicates that the employee desire this assignment.
     requests = [
-        # Employee 3 wants the first Saturday off.
+        # # Employee 3 wants the first Saturday off.
         # (3, 0, 5, -2),
-        # Employee 5 wants a night shift on the second Thursday.
+        # # Employee 5 wants a night shift on the second Thursday.
         # (5, 3, 10, -2),
-        # Employee 2 does not want a night shift on the first Friday.
+        # # Employee 2 does not want a night shift on the first Friday.
         # (2, 3, 4, 4)
-        # (325, 0, 0, -1)
-        # (325, 0, 1, -1)
     ]
-
-    # Locum ideally wants to have a DAY OFF on every day
-    # hijacking requests to add a weighting
-    # requests += [(325, 0, j, -10) for j in range(len(days))]
 
     # Shift constraints on continuous sequence :
     #     (shift, hard_min, soft_min, min_penalty,
     #             soft_max, hard_max, max_penalty)
     shift_constraints = [
         # One or two consecutive days of rest, this is a hard constraint.
-        # (0, 1, 10, 4, 15, 24, 4), # <-- might be problematic.
+        (0, 89, 89, 0, 90, 90, 0),
         # betweem 2 and 3 consecutive days of night shifts, 1 and 4 are
         # possible but penalized.
-        (2, 1, 2, 20, 2, 3, 5),
+        # (3, 1, 2, 20, 3, 4, 5),
     ]
 
     # Weekly sum constraints on shifts days:
@@ -276,9 +257,9 @@ def solve_shift_scheduling(params, output_proto, input):
     #     (previous_shift, next_shift, penalty (0 means forbidden))
     penalized_transitions = [
         # Afternoon to night has a penalty of 4.
-        (1, 2, 0),
+        (2, 3, 4),
         # Night to morning is forbidden.
-        (2, 1, 0),
+        (3, 1, 0),
     ]
 
     # daily demands for work shifts (morning, afternon, night) for each day
@@ -296,16 +277,18 @@ def solve_shift_scheduling(params, output_proto, input):
     # Penalty for exceeding the cover constraint per shift type.
     # excess_cover_penalties = (2, 2, 5)
 
-    # num_days = num_weeks * 7
+    num_days = num_weeks * 7
     num_shifts = len(shifts)
+    num_grades = len(grades)
 
     model = cp_model.CpModel()
 
     work = {}
-    for e in users: # range(num_employees):
+    for e in ([0] + all_employees):
         for s in range(num_shifts):
-            for d in days: # range(num_days):
-                work[e, s, d] = model.NewBoolVar('work%i_%i_%i' % (e, s, d))
+            for g in range(num_grades):
+                for d in range(num_days):
+                    work[e, s, g, d] = model.NewBoolVar('work%i_%i_%i_%i' % (e, s, g, d))
 
     # Linear terms of the objective in a minimization context.
     obj_int_vars = []
@@ -313,23 +296,43 @@ def solve_shift_scheduling(params, output_proto, input):
     obj_bool_vars = []
     obj_bool_coeffs = []
 
-    # Each employee has exactly one shift per day.
-    for e in users: # range(num_employees):
-        for d in days: # range(num_days):
-            model.Add(sum(work[e, s, d] for s in range(num_shifts)) == 1)
+    # Exactly one shift per day.
+    for e in all_employees:
+        for d in range(num_days):
+            for g in range(num_grades):
+                model.Add(sum(work[e, s, g, d] for s in range(num_shifts)) == 1)
 
-    # for e in locums:
-    #     for d in days:
-    #         model.Add(sum(work[e, s, d] for s in range(num_shifts)) >= 0)
+    # min_shifts_per_employee = (num_shifts * num_days) // num_employees
+    # if num_shifts * num_days % num_employees == 0:
+    #     max_shifts_per_employee = min_shifts_per_employee
+    # else:
+    #     max_shifts_per_employee = min_shifts_per_employee + 1
+    # max_shifts_per_employee = 3
+    # print('%i < shifts < %i' % (min_shifts_per_employee, max_shifts_per_employee))
 
-    # Exactly one instance of that shift per day
-    for d in days: # srange(num_days):
-        for s in range(1, num_shifts):
-            model.Add(sum(work[(e, s, d)] for e in users) == 1)
+    for e in all_employees:
+        num_shifts_worked = 0
+        for d in range(num_days):
+            for s in range(1, num_shifts):
+                for g in range(num_grades):
+                    num_shifts_worked += work[(e, s, g, d)]
+        # model.Add(min_shifts_per_employee <= num_shifts_worked)
+        # model.Add(num_shifts_worked <= max_shifts_per_employee)
+        model.Add(num_shifts_worked <= 40)
+
+    # for e in ct_employees:
+    #     for d in range(num_days):
+    #         for s in range(1, num_shifts):
+    #             model.Add(work[(e, s, 1, d)] == 0)
+    #
+    # for e in st_employees:
+    #     for d in range(num_days):
+    #         for s in range(1, num_shifts):
+    #             model.Add(work[(e, s, 0, d)] == 0)
 
     # Fixed assignments.
-    for e, s, d in fixed_assignments:
-        model.Add(work[e, s, d] == 1)
+    # for e, s, d in fixed_assignments:
+    #     model.Add(work[e, s, d] == 1)
 
     # Employee requests
     for e, s, d, w in requests:
@@ -339,73 +342,46 @@ def solve_shift_scheduling(params, output_proto, input):
     # Shift constraints
     for ct in shift_constraints:
         shift, hard_min, soft_min, min_cost, soft_max, hard_max, max_cost = ct
-        for e in users: # range(num_employees):
-            works = [work[e, shift, d] for d in days]
-            variables, coeffs = add_soft_sequence_constraint(
-                model, works, hard_min, soft_min, min_cost, soft_max, hard_max,
-                max_cost, 'shift_constraint(employee %i, shift %i)' % (e,
-                                                                       shift))
-            obj_bool_vars.extend(variables)
-            obj_bool_coeffs.extend(coeffs)
-
-    for e in users: # range(num_employees):
-        num_shifts_worked = 0
-        num_days_worked = 0
-        num_nights_worked = 0
-        for d in days: # range(num_days):
-            for s in range(1, num_shifts):
-                w = work[(e, s, d)]
-                num_shifts_worked += w
-                if s == 1:
-                    num_days_worked += w
-                elif s == 2:
-                    num_nights_worked += w
-        # model.Add(min_shifts_per_employee <= num_shifts_worked)
-        # model.Add(num_shifts_worked <= max_shifts_per_employee)
-
-        model.Add(num_shifts_worked <= 3)
-        model.Add(num_days_worked <= 2)
-        model.Add(num_nights_worked <= 2)
-
-    # for e in locums: # range(num_employees):
-    #     num_shifts_worked = 0
-    #     for d in days: # range(num_days):
-    #         for s in range(1, num_shifts):
-    #             w = work[(e, s, d)]
-    #
-    #     model.Add(num_shifts_worked >= 0)
+        for e in all_employees:
+            for g in range(num_grades):
+                works = [work[e, shift, g, d] for d in range(num_days)]
+                variables, coeffs = add_soft_sequence_constraint(
+                    model, works, hard_min, soft_min, min_cost, soft_max, hard_max,
+                    max_cost, 'shift_constraint(employee %i, shift %i, grade %i)' % (e, g, shift))
+                obj_bool_vars.extend(variables)
+                obj_bool_coeffs.extend(coeffs)
 
     # Weekly sum constraints
-    for ct in weekly_sum_constraints:
-        shift, hard_min, soft_min, min_cost, soft_max, hard_max, max_cost = ct
-        for e in range(num_employees):
-            for w in range(num_weeks):
-                works = [work[e, shift, d + w * 7] for d in range(7)]
-                variables, coeffs = add_soft_sum_constraint(
-                    model, works, hard_min, soft_min, min_cost, soft_max,
-                    hard_max, max_cost,
-                    'weekly_sum_constraint(employee %i, shift %i, week %i)' %
-                    (e, shift, w))
-                obj_int_vars.extend(variables)
-                obj_int_coeffs.extend(coeffs)
+    # for ct in weekly_sum_constraints:
+    #     shift, hard_min, soft_min, min_cost, soft_max, hard_max, max_cost = ct
+    #     for e in range(num_employees):
+    #         for w in range(num_weeks):
+    #             works = [work[e, shift, d + w * 7] for d in range(7)]
+    #             variables, coeffs = add_soft_sum_constraint(
+    #                 model, works, hard_min, soft_min, min_cost, soft_max,
+    #                 hard_max, max_cost,
+    #                 'weekly_sum_constraint(employee %i, shift %i, week %i)' %
+    #                 (e, shift, w))
+    #             obj_int_vars.extend(variables)
+    #             obj_int_coeffs.extend(coeffs)
 
     # Penalized transitions
-    for previous_shift, next_shift, cost in penalized_transitions:
-        for e in users: # range(num_employees):
-            for d in range(len(days) - 1):
-                transition = [
-                    work[e, previous_shift, d].Not(),
-                    work[e, next_shift, d + 1].Not()
-                ]
-                if cost == 0:
-                    model.AddBoolOr(transition)
-                else:
-                    trans_var = model.NewBoolVar(
-                        'transition (employee=%i, day=%i)' % (e, d))
-                    transition.append(trans_var)
-                    model.AddBoolOr(transition)
-                    obj_bool_vars.append(trans_var)
-                    obj_bool_coeffs.append(cost)
+    # for previous_shift, next_shift, cost in penalized_transitions:
+    #     for e in range(num_employees):
+    #         for d in range(num_days - 1):
+    #             transition = [
+    #                 work[e, previous_shift, d].Not(),
+    #                 work[e, next_shift, d + 1].Not()
+    #             ]
+    #             if cost == 0:
+    #                 model.AddBoolOr(transition)
+    #             else:
+    #                 trans_var = model.NewBoolVar(
+    #                     'transition (employee=%i, day=%i)' % (e, d))
+    #                 transition.append(trans_var)
+    #                 model.AddBoolOr(transition)
+    #                 obj_bool_vars.append(trans_var)
+    #                 obj_bool_coeffs.append(cost)
 
     # Cover constraints
     # for s in range(1, num_shifts):
@@ -440,34 +416,30 @@ def solve_shift_scheduling(params, output_proto, input):
 
     # Solve the model.
     solver = cp_model.CpSolver()
-    # solver.parameters.max_time_in_seconds = 120
     solver.parameters.num_search_workers = 8
     if params:
         text_format.Merge(params, solver.parameters)
     solution_printer = cp_model.ObjectiveSolutionPrinter()
-    print('Start solving!!!')
     status = solver.SolveWithSolutionCallback(model, solution_printer)
 
     # Print solution.
     if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
-        result = {}
-        result['status'] = status
-
         print()
         header = '          '
-        for w in range(math.ceil(len(days) / 7)):
-            header += 'M T W T F S S '
+        for w in range(num_weeks):
+            header += 'M   T   W   T   F   S   S   '
         print(header)
-        for e in users:
+        for e in all_employees:
             schedule = ''
-            for d in days: # range(num_days):
+            for d in range(num_days):
                 for s in range(num_shifts):
-                    if solver.BooleanValue(work[e, s, d]):
-                        if s > 0:
-                            result[(e, d)] = s
-                        schedule += shifts[s] + ' '
+                    for g in range(num_grades):
+                        if solver.BooleanValue(work[e, s, g, d]):
+                            if s == 0:
+                                schedule += '--- '
+                            else:
+                                schedule += grades[g] + shifts[s] + ' '
             print('worker %i: %s' % (e, schedule))
-        print(result)
         print()
         print('Penalties:')
         for i, var in enumerate(obj_bool_vars):
@@ -489,7 +461,7 @@ def solve_shift_scheduling(params, output_proto, input):
 
 def main(args):
     """Main."""
-    solve_shift_scheduling(args.params, args.output_proto, args.input)
+    solve_shift_scheduling(args.params, args.output_proto)
 
 
 if __name__ == '__main__':
